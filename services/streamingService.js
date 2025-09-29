@@ -2,6 +2,7 @@
 const { spawn, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const schedulerService = require('./schedulerService');
 const { v4: uuidv4 } = require('uuid');
@@ -26,12 +27,31 @@ const MAX_RETRY_ATTEMPTS = 3;
 const manuallyStoppingStreams = new Set();
 const MAX_LOG_LINES = 100;
 
-/* -------------------- INGEST LOCK (hindari 2 proses ke RTMP utama yg sama) --- */
+/* -------------------- INGEST LOCKS -------------------- */
+// In-memory (mencegah duplikat di proses ini)
 const ingestLocks = new Map(); // key: `${rtmp_url}|${stream_key}` -> streamId
-function getIngestKey(s) { return `${s.rtmp_url}|${s.stream_key}`; }
-/* ----------------------------------------------------------------------------- */
+function ingestKeyOf(s) { return `${s.rtmp_url}|${s.stream_key}`; }
 
-/* -------------------- UTIL BARU: kill & wait -------------------- */
+// OS-level file lock (mencegah duplikat lintas proses/instance di mesin yang sama)
+function lockPathOf(ingestKey) {
+  const h = crypto.createHash('sha1').update(ingestKey).digest('hex');
+  return `/tmp/ingest-${h}.lock`;
+}
+async function acquireFileLock(lockPath) {
+  return new Promise((resolve) => {
+    fs.open(lockPath, 'wx', (err, fd) => {
+      if (err) return resolve(null); // EEXIST -> sudah di-lock
+      const info = `${process.pid} ${new Date().toISOString()}\n`;
+      fs.write(fd, info, () => fs.close(fd, () => resolve(lockPath)));
+    });
+  });
+}
+async function releaseFileLock(lockPath) {
+  try { await fs.promises.unlink(lockPath); } catch (_) {}
+}
+/* ----------------------------------------------------- */
+
+/* -------------------- UTIL: kill & wait -------------------- */
 function addStreamLog(streamId, message) {
   if (!streamLogs.has(streamId)) streamLogs.set(streamId, []);
   const logs = streamLogs.get(streamId);
@@ -44,23 +64,16 @@ function execAsync(cmd) {
 }
 
 async function forceKillAllFfmpeg() {
-  // Bersihkan proses ffmpeg yatim (jika ada)
   await execAsync('pkill -9 ffmpeg || true');
 }
 
-function wait(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+function wait(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function gracefulThenForceKill(child, graceMs = 5000) {
   if (!child) return;
-
   try { child.kill('SIGTERM'); } catch {}
   await wait(graceMs);
-
-  // Jika masih hidup → paksa
   try { if (!child.killed) child.kill('SIGKILL'); } catch {}
-  // Double-ensure: bunuh semua ffmpeg yatim
   await forceKillAllFfmpeg();
 }
 
@@ -69,10 +82,10 @@ function waitForClose(child, timeoutMs = 15000) {
     let done = false;
     const onClose = () => { if (!done) { done = true; resolve(); } };
     child.once('close', onClose);
-    setTimeout(() => onClose(), timeoutMs); // fallback jika event tidak datang
+    setTimeout(() => onClose(), timeoutMs);
   });
 }
-/* ---------------------------------------------------------------- */
+/* ---------------------------------------------------------- */
 
 async function buildFFmpegArgs(stream) {
   const video = await Video.findById(stream.video_id);
@@ -94,7 +107,6 @@ async function buildFFmpegArgs(stream) {
 
   const rtmpUrl = `${stream.rtmp_url.replace(/\/$/, '')}/${stream.stream_key}`;
 
-  // perbaikan: pastikan format opsi loop valid untuk ffmpeg spawn array
   const loopEnabled = !!stream.loop_video;
   const loopArgs = loopEnabled ? ['-stream_loop', '-1'] : ['-stream_loop', '0'];
 
@@ -141,6 +153,9 @@ async function buildFFmpegArgs(stream) {
 }
 
 async function startStream(streamId) {
+  let fileLock = null;
+  let ingestKey = null;
+
   try {
     streamRetryCount.set(streamId, 0);
     if (activeStreams.has(streamId)) {
@@ -150,33 +165,41 @@ async function startStream(streamId) {
     const stream = await Stream.findById(streamId);
     if (!stream) return { success: false, error: 'Stream not found' };
 
-    // (Opsional) HINDARI kill global agar tidak memutus stream lain.
-    // Jika benar-benar dibutuhkan, aktifkan via env:
+    // (Opsional) kill global hanya jika diminta
     if (process.env.FORCE_KILL_ALL_FFMPEG === '1') {
       await forceKillAllFfmpeg();
     }
 
-    // --------- LOCK: Cegah 2 stream pakai RTMP+key yang sama ----------
-    const ingestKey = getIngestKey(stream);
-    // Jika sudah dikunci oleh stream lain -> tolak sebelum spawn ffmpeg
-    if (ingestLocks.has(ingestKey) && ingestLocks.get(ingestKey) !== streamId) {
+    // --------- LOCK: OS-level + in-memory ----------
+    ingestKey = ingestKeyOf(stream);
+    const lockPath = lockPathOf(ingestKey);
+
+    // Cek lock OS (lintas proses/instance)
+    const got = await acquireFileLock(lockPath);
+    if (!got) {
       return {
         success: false,
-        error: 'RTMP URL & key sedang dipakai stream lain (primary). Jalankan proses kedua ke Backup URL.'
+        error: 'Ingest ini sudah aktif (lock OS). Jalankan proses kedua ke Backup URL, bukan Primary.'
       };
     }
-    // Cek juga terhadap activeStreams yang sudah berjalan
-    for (const [id] of activeStreams.entries()){
-      if (id !== streamId){
+    fileLock = lockPath;
+
+    // Cek in-memory duplikat (proses ini)
+    if (ingestLocks.has(ingestKey) && ingestLocks.get(ingestKey) !== streamId) {
+      await releaseFileLock(fileLock);
+      return { success: false, error: 'RTMP URL & key sedang dipakai stream lain (primary). Gunakan Backup URL.' };
+    }
+    for (const [id] of activeStreams.entries()) {
+      if (id !== streamId) {
         const other = await Stream.findById(id);
         if (other && other.rtmp_url === stream.rtmp_url && other.stream_key === stream.stream_key) {
+          await releaseFileLock(fileLock);
           return { success:false, error:'Duplikat ingest terdeteksi. Hanya satu proses ke URL utama.' };
         }
       }
     }
-    // Pasang lock sebelum konek
     ingestLocks.set(ingestKey, streamId);
-    // -------------------------------------------------------------------
+    // -----------------------------------------------
 
     const ffmpegArgs = await buildFFmpegArgs(stream);
     const fullCommand = `${ffmpegPath} ${ffmpegArgs.join(' ')}`;
@@ -216,10 +239,9 @@ async function startStream(streamId) {
       const wasActive = activeStreams.delete(streamId);
       const isManualStop = manuallyStoppingStreams.has(streamId);
 
-      // Lepas lock saat proses berakhir
-      try {
-        ingestLocks.delete(ingestKey);
-      } catch {}
+      // Lepas lock OS + in-memory saat proses berakhir
+      try { if (fileLock) await releaseFileLock(fileLock); } catch {}
+      try { if (ingestKey) ingestLocks.delete(ingestKey); } catch {}
 
       if (isManualStop) {
         console.log(`[StreamingService] Stream ${streamId} was manually stopped, not restarting`);
@@ -314,11 +336,10 @@ async function startStream(streamId) {
       console.error(`[FFMPEG_PROCESS_ERROR] ${streamId}: ${err.message}`);
       activeStreams.delete(streamId);
       try { await Stream.updateStatus(streamId, 'offline'); } catch {}
-      // Lepas lock jika error sebelum update status
-      try {
-        const st = await Stream.findById(streamId);
-        if (st) ingestLocks.delete(getIngestKey(st));
-      } catch {}
+
+      // Lepas lock jika error
+      try { if (fileLock) await releaseFileLock(fileLock); } catch {}
+      try { if (ingestKey) ingestLocks.delete(ingestKey); } catch {}
     });
 
     ffmpegProcess.unref();
@@ -333,11 +354,9 @@ async function startStream(streamId) {
       isAdvancedMode: stream.use_advanced_settings
     };
   } catch (error) {
-    // Pastikan lock dilepas jika gagal sebelum spawn
-    try {
-      const st = await Stream.findById(streamId);
-      if (st) ingestLocks.delete(getIngestKey(st));
-    } catch {}
+    // Pastikan lock dilepas jika gagal sebelum spawn/selesai
+    try { if (fileLock) await releaseFileLock(fileLock); } catch {}
+    try { if (ingestKey) ingestLocks.delete(ingestKey); } catch {}
     addStreamLog(streamId, `Failed to start stream: ${error.message}`);
     console.error(`Error starting stream ${streamId}:`, error);
     return { success: false, error: error.message };
@@ -367,7 +386,6 @@ async function stopStream(streamId) {
     console.log(`[StreamingService] Stopping active stream ${streamId}`);
     manuallyStoppingStreams.add(streamId);
 
-    // Graceful → Force → tunggu close → cleanup
     await gracefulThenForceKill(ffmpegProcess, 5000);
     await waitForClose(ffmpegProcess, 15000);
 
@@ -376,11 +394,13 @@ async function stopStream(streamId) {
 
     const stream = await Stream.findById(streamId);
     if (stream) {
-      // Lepas lock karena stream ini berhenti
-      try { ingestLocks.delete(getIngestKey(stream)); } catch {}
       await Stream.updateStatus(streamId, 'offline', stream.user_id);
       const updatedStream = await Stream.findById(streamId);
       await saveStreamHistory(updatedStream);
+
+      // Lepas lock OS + in-memory
+      try { await releaseFileLock(lockPathOf(ingestKeyOf(stream))); } catch {}
+      try { ingestLocks.delete(ingestKeyOf(stream)); } catch {}
     }
 
     if (schedulerService?.cancelStreamTermination) {
@@ -518,5 +538,10 @@ module.exports = {
   waitForInactive
 };
 
-// keep existing init call
-schedulerService.init(module.exports);
+// Scheduler guard: hanya aktif jika diizinkan lewat ENV
+if (process.env.SCHEDULER_ENABLED === '1') {
+  schedulerService.init(module.exports);
+  console.log('[Scheduler] ENABLED on this instance');
+} else {
+  console.log('[Scheduler] DISABLED on this instance');
+}
