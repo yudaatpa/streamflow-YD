@@ -38,7 +38,14 @@ async function checkScheduledStreams() {
 
         // tambahan: bersihkan kemungkinan sisa proses sebelum start
         await streamingService.stopStream(stream.id);
-        await sleep(1500);
+
+        // Pastikan proses benar-benar mati supaya tidak duplikat koneksi ke RTMP primary
+        if (typeof streamingService.waitForInactive === 'function') {
+          await streamingService.waitForInactive(stream.id, 15000);
+        } else {
+          await sleep(1500);
+        }
+        await sleep(500); // jeda ekstra aman
 
         const result = await streamingService.startStream(stream.id);
         if (result.success) {
