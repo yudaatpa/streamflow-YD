@@ -26,6 +26,11 @@ const MAX_RETRY_ATTEMPTS = 3;
 const manuallyStoppingStreams = new Set();
 const MAX_LOG_LINES = 100;
 
+/* -------------------- INGEST LOCK (hindari 2 proses ke RTMP utama yg sama) --- */
+const ingestLocks = new Map(); // key: `${rtmp_url}|${stream_key}` -> streamId
+function getIngestKey(s) { return `${s.rtmp_url}|${s.stream_key}`; }
+/* ----------------------------------------------------------------------------- */
+
 /* -------------------- UTIL BARU: kill & wait -------------------- */
 function addStreamLog(streamId, message) {
   if (!streamLogs.has(streamId)) streamLogs.set(streamId, []);
@@ -145,8 +150,33 @@ async function startStream(streamId) {
     const stream = await Stream.findById(streamId);
     if (!stream) return { success: false, error: 'Stream not found' };
 
-    // Tambahan: bersihkan orphan ffmpeg SEBELUM start
-    await forceKillAllFfmpeg();
+    // (Opsional) HINDARI kill global agar tidak memutus stream lain.
+    // Jika benar-benar dibutuhkan, aktifkan via env:
+    if (process.env.FORCE_KILL_ALL_FFMPEG === '1') {
+      await forceKillAllFfmpeg();
+    }
+
+    // --------- LOCK: Cegah 2 stream pakai RTMP+key yang sama ----------
+    const ingestKey = getIngestKey(stream);
+    // Jika sudah dikunci oleh stream lain -> tolak sebelum spawn ffmpeg
+    if (ingestLocks.has(ingestKey) && ingestLocks.get(ingestKey) !== streamId) {
+      return {
+        success: false,
+        error: 'RTMP URL & key sedang dipakai stream lain (primary). Jalankan proses kedua ke Backup URL.'
+      };
+    }
+    // Cek juga terhadap activeStreams yang sudah berjalan
+    for (const [id] of activeStreams.entries()){
+      if (id !== streamId){
+        const other = await Stream.findById(id);
+        if (other && other.rtmp_url === stream.rtmp_url && other.stream_key === stream.stream_key) {
+          return { success:false, error:'Duplikat ingest terdeteksi. Hanya satu proses ke URL utama.' };
+        }
+      }
+    }
+    // Pasang lock sebelum konek
+    ingestLocks.set(ingestKey, streamId);
+    // -------------------------------------------------------------------
 
     const ffmpegArgs = await buildFFmpegArgs(stream);
     const fullCommand = `${ffmpegPath} ${ffmpegArgs.join(' ')}`;
@@ -185,6 +215,11 @@ async function startStream(streamId) {
 
       const wasActive = activeStreams.delete(streamId);
       const isManualStop = manuallyStoppingStreams.has(streamId);
+
+      // Lepas lock saat proses berakhir
+      try {
+        ingestLocks.delete(ingestKey);
+      } catch {}
 
       if (isManualStop) {
         console.log(`[StreamingService] Stream ${streamId} was manually stopped, not restarting`);
@@ -279,6 +314,11 @@ async function startStream(streamId) {
       console.error(`[FFMPEG_PROCESS_ERROR] ${streamId}: ${err.message}`);
       activeStreams.delete(streamId);
       try { await Stream.updateStatus(streamId, 'offline'); } catch {}
+      // Lepas lock jika error sebelum update status
+      try {
+        const st = await Stream.findById(streamId);
+        if (st) ingestLocks.delete(getIngestKey(st));
+      } catch {}
     });
 
     ffmpegProcess.unref();
@@ -293,6 +333,11 @@ async function startStream(streamId) {
       isAdvancedMode: stream.use_advanced_settings
     };
   } catch (error) {
+    // Pastikan lock dilepas jika gagal sebelum spawn
+    try {
+      const st = await Stream.findById(streamId);
+      if (st) ingestLocks.delete(getIngestKey(st));
+    } catch {}
     addStreamLog(streamId, `Failed to start stream: ${error.message}`);
     console.error(`Error starting stream ${streamId}:`, error);
     return { success: false, error: error.message };
@@ -331,6 +376,8 @@ async function stopStream(streamId) {
 
     const stream = await Stream.findById(streamId);
     if (stream) {
+      // Lepas lock karena stream ini berhenti
+      try { ingestLocks.delete(getIngestKey(stream)); } catch {}
       await Stream.updateStatus(streamId, 'offline', stream.user_id);
       const updatedStream = await Stream.findById(streamId);
       await saveStreamHistory(updatedStream);
@@ -346,6 +393,16 @@ async function stopStream(streamId) {
     console.error(`[StreamingService] Error stopping stream ${streamId}:`, error);
     return { success: false, error: error.message };
   }
+}
+
+// Tunggu sampai proses stream benar-benar tidak aktif
+async function waitForInactive(streamId, timeoutMs = 15000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (!activeStreams.has(streamId)) return true;
+    await wait(200);
+  }
+  return !activeStreams.has(streamId);
 }
 
 async function syncStreamStatuses() {
@@ -457,7 +514,8 @@ module.exports = {
   getActiveStreams,
   getStreamLogs,
   syncStreamStatuses,
-  saveStreamHistory
+  saveStreamHistory,
+  waitForInactive
 };
 
 // keep existing init call
